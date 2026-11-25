@@ -1,0 +1,346 @@
+diff --git a/index.html b/index.html
+index 52c8ea2..6716778 100644
+--- a/index.html
++++ b/index.html
+@@ -3,6 +3,7 @@
+   <head>
+     <meta charset="UTF-8" />
+     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
++    <link rel="icon" href="data:," />
+     <title>Verenu</title>
+   </head>
+   <body>
+diff --git a/src-tauri/src/app_hotkey.rs b/src-tauri/src/app_hotkey.rs
+index 96b2c7a..5093a39 100644
+--- a/src-tauri/src/app_hotkey.rs
++++ b/src-tauri/src/app_hotkey.rs
+@@ -278,6 +278,8 @@ pub(crate) fn setup_hotkey(app: &mut tauri::App, shared: SharedState) {
+                         )
+                     };
+                     if is_handless {
++                        handsfree_stop_guard.arm(Instant::now());
++                        crate::core::hotkey::reset_chord_state();
+                         crate::core::hotkey::set_handless_active(false);
+                         if has_session {
+                             tauri::async_runtime::spawn(pipeline::run_pipeline(
+diff --git a/src-tauri/src/core/hotkey/gesture.rs b/src-tauri/src/core/hotkey/gesture.rs
+index c747d7f..e3e39c9 100644
+--- a/src-tauri/src/core/hotkey/gesture.rs
++++ b/src-tauri/src/core/hotkey/gesture.rs
+@@ -78,6 +78,8 @@ pub(super) struct ChordStateMachine {
+     space_down: bool,
+     space_passed_through: bool,
+     handless_from_chord: bool,
++    pub(super) single_tap: bool,
++    pub(super) handsfree_active: bool,
+ }
+ 
+ #[derive(Default, Clone)]
+@@ -112,6 +114,8 @@ impl ChordStateMachine {
+             space_down: false,
+             space_passed_through: false,
+             handless_from_chord: false,
++            single_tap: false,
++            handsfree_active: false,
+         }
+     }
+     fn key_down_mut(&mut self, key: ChordKey) -> &mut bool {
+@@ -254,6 +258,19 @@ impl ChordStateMachine {
+ 
+         self.chord_first_down_ms = now_ms;
+ 
++        if self.single_tap {
++            self.tap = TapState::None;
++            if self.handsfree_active {
++                // Stop once on the new chord, regardless of its later hold
++                // duration. Its release must never start another recording.
++                self.chord_down = false;
++                self.handless_from_chord = true;
++                return ChordOutcome::suppress(Some(ChordAction::FireHandless));
++            }
++            self.chord_down = true;
++            return ChordOutcome::suppress(Some(ChordAction::FirePress));
++        }
++
+         if let TapState::AwaitingSecondTap { deadline_start_ms } = self.tap {
+             if now_ms.saturating_sub(deadline_start_ms) <= CHORD_DOUBLE_TAP_WINDOW_MS {
+                 self.tap = TapState::None;
+@@ -327,8 +344,17 @@ impl ChordStateMachine {
+         if self.chord_down {
+             self.chord_down = false;
+             let held_ms = now_ms.saturating_sub(self.chord_first_down_ms);
+-            if held_ms >= CHORD_TAP_MAX_HOLD_MS {
++            let hold_threshold = if self.single_tap {
++                350
++            } else {
++                CHORD_TAP_MAX_HOLD_MS
++            };
++            if held_ms >= hold_threshold {
+                 action = Some(ChordAction::FireRelease);
++            } else if self.single_tap {
++                self.handless_from_chord = true;
++                self.tap = TapState::None;
++                action = Some(ChordAction::FireHandless);
+             } else {
+                 action = Some(ChordAction::FireCancel);
+                 self.tap = TapState::WaitingForFullRelease;
+@@ -367,6 +393,108 @@ impl ChordStateMachine {
+ 
+ #[cfg(test)]
+ mod chord_tests {
++    #[test]
++    fn single_tap_accepts_staggered_keys_and_both_release_orders() {
++        for delay in [0, 150, 500, 2000] {
++            for first in [0, 1] {
++                for release_first in [0, 1] {
++                    let mut m = super::ChordStateMachine::with_key_count(2);
++                    m.single_tap = true;
++                    m.on_key_event(super::ChordKey(first), super::KeyEdge::Down, 0);
++                    m.reconcile_stale_key(super::ChordKey(first), true, delay);
++                    assert_eq!(
++                        m.on_key_event(super::ChordKey(1 - first), super::KeyEdge::Down, delay)
++                            .action,
++                        Some(super::ChordAction::FirePress)
++                    );
++                    assert_eq!(
++                        m.on_key_event(
++                            super::ChordKey(release_first),
++                            super::KeyEdge::Up,
++                            delay + 100
++                        )
++                        .action,
++                        Some(super::ChordAction::FireHandless)
++                    );
++                    assert_eq!(
++                        m.on_key_event(
++                            super::ChordKey(1 - release_first),
++                            super::KeyEdge::Up,
++                            delay + 120
++                        )
++                        .action,
++                        None
++                    );
++                    assert!(m.keys.iter().all(|key| !key.down));
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn single_tap_stop_fires_once_on_chord_formation() {
++        let mut m = super::ChordStateMachine::with_key_count(2);
++        m.single_tap = true;
++        m.handsfree_active = true;
++        m.on_key_event(super::ChordKey(0), super::KeyEdge::Down, 0);
++        assert_eq!(
++            m.on_key_event(super::ChordKey(1), super::KeyEdge::Down, 700)
++                .action,
++            Some(super::ChordAction::FireHandless)
++        );
++        assert_eq!(
++            m.on_key_event(super::ChordKey(1), super::KeyEdge::Down, 750)
++                .action,
++            None
++        );
++        m.handsfree_active = false;
++        assert_eq!(
++            m.on_key_event(super::ChordKey(0), super::KeyEdge::Up, 800)
++                .action,
++            None
++        );
++        assert_eq!(
++            m.on_key_event(super::ChordKey(1), super::KeyEdge::Up, 820)
++                .action,
++            None
++        );
++    }
++
++    #[test]
++    fn single_tap_hold_uses_complete_chord_time() {
++        for held in [350, 1000] {
++            let mut m = super::ChordStateMachine::with_key_count(2);
++            m.single_tap = true;
++            m.on_key_event(super::ChordKey(0), super::KeyEdge::Down, 0);
++            m.on_key_event(super::ChordKey(1), super::KeyEdge::Down, 2000);
++            assert_eq!(
++                m.on_key_event(super::ChordKey(0), super::KeyEdge::Up, 2000 + held)
++                    .action,
++                Some(super::ChordAction::FireRelease)
++            );
++            assert_eq!(
++                m.on_key_event(super::ChordKey(1), super::KeyEdge::Up, 2020 + held)
++                    .action,
++                None
++            );
++        }
++    }
++
++    #[test]
++    fn single_tap_does_not_turn_a_second_start_into_double_tap_mode() {
++        let mut m = super::ChordStateMachine::with_key_count(2);
++        m.single_tap = true;
++        m.on_key_event(super::ChordKey(0), super::KeyEdge::Down, 0);
++        m.on_key_event(super::ChordKey(1), super::KeyEdge::Down, 10);
++        m.on_key_event(super::ChordKey(0), super::KeyEdge::Up, 50);
++        m.on_key_event(super::ChordKey(1), super::KeyEdge::Up, 60);
++        m.on_key_event(super::ChordKey(0), super::KeyEdge::Down, 100);
++        assert_eq!(
++            m.on_key_event(super::ChordKey(1), super::KeyEdge::Down, 110)
++                .action,
++            Some(super::ChordAction::FirePress)
++        );
++    }
+     use super::*;
+ 
+     fn fresh() -> ChordStateMachine {
+diff --git a/src-tauri/src/core/hotkey/win.rs b/src-tauri/src/core/hotkey/win.rs
+index 35fb379..a1e3d78 100644
+--- a/src-tauri/src/core/hotkey/win.rs
++++ b/src-tauri/src/core/hotkey/win.rs
+@@ -468,9 +468,15 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
+                     keys.clone()
+                 };
+                 CHORD_MACHINE.with(|m| {
+-                    *m.borrow_mut() = ChordStateMachine::with_partial_passthrough(
++                    let mut machine = ChordStateMachine::with_partial_passthrough(
+                         keys.iter().map(|key| is_hotkey_modifier_vk(*key)).collect(),
+-                    )
++                    );
++                    // Fidelity opts in at launch. Other bindings/platforms
++                    // retain their existing double-tap/Space behavior.
++                    machine.single_tap = single_tap_binding(&keys)
++                        && std::env::var_os("VERENU_SINGLE_TAP_HOTKEY")
++                            .is_some_and(|value| value == "1");
++                    *m.borrow_mut() = machine;
+                 });
+                 LOCAL_KEYS.with(|local| *local.borrow_mut() = keys);
+                 LOCAL_GENERATION.with(|local| local.set(generation));
+@@ -506,6 +512,7 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
+                 let keys = keys.borrow();
+                 CHORD_MACHINE.with(|m| {
+                     let mut machine = m.borrow_mut();
++                    machine.handsfree_active = HANDLESS_ACTIVE.load(Ordering::SeqCst);
+                     for (other, id) in keys.iter().enumerate().filter(|(other, _)| *other != index)
+                     {
+                         machine.reconcile_stale_key(ChordKey(other), modifier_held(*id), now);
+@@ -526,7 +533,9 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
+ 
+             if matches!(
+                 action,
+-                Some(ChordAction::FireRelease) | Some(ChordAction::FireCancel)
++                Some(ChordAction::FireRelease)
++                    | Some(ChordAction::FireCancel)
++                    | Some(ChordAction::FireHandless)
+             ) && ESCAPE_CANCELLED.swap(false, Ordering::SeqCst)
+             {
+                 // Escape already handled cancellation while the chord was
+@@ -707,10 +716,26 @@ fn should_suppress_synthetic_paste_event(is_injected: bool, now: u64, suppress_u
+     is_injected && now < suppress_until
+ }
+ 
++fn single_tap_binding(keys: &[u32]) -> bool {
++    keys.len() == 2
++        && keys.iter().any(|key| matches!(key, 162 | 163))
++        && keys.iter().any(|key| matches!(key, 91 | 92))
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn single_tap_only_applies_to_control_windows_binding() {
++        for keys in [[162, 91], [92, 163], [91, 162]] {
++            assert!(single_tap_binding(&keys));
++        }
++        for keys in [vec![162], vec![162, 65], vec![162, 91, 65]] {
++            assert!(!single_tap_binding(&keys));
++        }
++    }
++
+     #[test]
+     fn modifier_only_bindings_are_unavailable() {
+         for key in ["ControlLeft", "AltLeft", "ShiftLeft", "MetaLeft"] {
+diff --git a/src-tauri/src/data/db/contexts.rs b/src-tauri/src/data/db/contexts.rs
+index 68ecee0..d2e85e8 100644
+--- a/src-tauri/src/data/db/contexts.rs
++++ b/src-tauri/src/data/db/contexts.rs
+@@ -884,7 +884,7 @@ pub fn remove_context_website(db: &Db, context_id: i64, domain: &str) -> Result<
+ /// the stable Everywhere context.
+ /// Resolution order: sub-app (app + window-title rule), website, app,
+ /// Everywhere. Returns the matched sub-app too so the pill can name it.
+-#[cfg(any(target_os = "linux", test))]
++#[cfg(any(target_os = "linux", test, feature = "dev-session"))]
+ pub fn resolve_context_for_target(
+     db: &Db,
+     executable: &str,
+diff --git a/src/lib/devSession.test.ts b/src/lib/devSession.test.ts
+index e5b23ec..3d10ad5 100644
+--- a/src/lib/devSession.test.ts
++++ b/src/lib/devSession.test.ts
+@@ -1,6 +1,46 @@
+-import { describe, expect, it } from 'vitest';
++import { afterEach, describe, expect, it, vi } from 'vitest';
+ import { encodePcmWav, loadSessionFixture } from './devSession';
+ 
++describe('browser session response failures', () => {
++  afterEach(() => {
++    vi.clearAllTimers();
++    vi.useRealTimers();
++    vi.unstubAllGlobals();
++    vi.unstubAllEnvs();
++    vi.resetModules();
++  });
++
++  async function connectedSession() {
++    vi.useFakeTimers();
++    vi.stubEnv('VITE_VERENU_SESSION', '1');
++    vi.stubGlobal('window', { addEventListener: vi.fn() });
++    vi.stubGlobal('location', { hash: '' });
++    vi.stubGlobal('sessionStorage', { getItem: () => 'public-test-token' });
++    const fetcher = vi.fn(async () => new Response(JSON.stringify({
++      transport: 'rust-live', id: import.meta.env.VITE_VERENU_SESSION_ID,
++      eventCursor: 0, cursor: 0, events: [],
++    }), { status: 200 }));
++    vi.stubGlobal('fetch', fetcher);
++    vi.resetModules();
++    const session = await import('./devSession');
++    await session.initializeDevSession();
++    return { session, fetcher };
++  }
++
++  it('rejects an interrupted successful response instead of returning null to model stores', async () => {
++    const { session, fetcher } = await connectedSession();
++    const interrupted = new TypeError('Failed to fetch');
++    fetcher.mockResolvedValueOnce({ ok: true, json: () => Promise.reject(interrupted) } as Response);
++    await expect(session.sessionRequest('/invoke')).rejects.toBe(interrupted);
++  });
++
++  it('keeps a useful error when an unsuccessful response has no readable JSON body', async () => {
++    const { session, fetcher } = await connectedSession();
++    fetcher.mockResolvedValueOnce({ ok: false, json: () => Promise.reject(new SyntaxError('Not JSON')) } as Response);
++    await expect(session.sessionRequest('/invoke')).rejects.toThrow('Dev backend is unavailable');
++  });
++});
++
+ describe('browser PCM conversion', () => {
+   it('rejects fixture loading outside an authenticated browser session', async () => {
+     await expect(loadSessionFixture('synthetic.wav')).rejects.toThrow('No browser dev session');
+diff --git a/src/lib/devSession.ts b/src/lib/devSession.ts
+index a53e1c2..9e2210e 100644
+--- a/src/lib/devSession.ts
++++ b/src/lib/devSession.ts
+@@ -28,7 +28,12 @@ export async function sessionRequest<T>(route: string, init: RequestInit = {}):
+   headers.set('Authorization', `Bearer ${token}`);
+   const timeout = route.startsWith('/audio') || route === '/invoke' ? 190_000 : 10_000;
+   const response = await fetch(`/__verenu_dev${route}`, { ...init, signal: init.signal || AbortSignal.timeout(timeout), headers, cache: 'no-store' });
+-  const value: unknown = await response.json().catch(() => null);
++  const value: unknown = await response.json().catch((error) => {
++    // Navigation can interrupt a body after its successful headers arrive.
++    // Propagate that failure instead of publishing null as valid model data.
++    if (response.ok) throw error;
++    return null;
++  });
+   if (!response.ok) throw new Error(value && typeof value === 'object' && 'error' in value ? String(value.error) : 'Dev backend is unavailable');
+   return value as T;
+ }

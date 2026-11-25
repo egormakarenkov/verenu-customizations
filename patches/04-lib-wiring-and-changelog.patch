@@ -1,0 +1,88 @@
+diff --git a/docs/CHANGELOG.md b/docs/CHANGELOG.md
+index 8440eb4..84c9c03 100644
+--- a/docs/CHANGELOG.md
++++ b/docs/CHANGELOG.md
+@@ -4,6 +4,12 @@ Notable project changes are recorded here. GitHub Release pages remain the sourc
+ 
+ ## Unreleased
+ 
++- Keep Loaded now retains local models under ordinary RAM pressure and preloads downloaded default models in the background when memory allows. Recovery requires stable memory headroom and a retry cooldown; critical RAM/GPU pressure still reclaims idle models. Other memory policies retain their one-minute recent-use grace period. Browser development sessions reject interrupted response bodies instead of passing null into model settings.
++
++- Fidelity Windows launches can handle Ctrl+Win single-tap hands-free directly, without a separate key-injection helper. Either press order and staggered modifier presses work; a short release enables hands-free, the next chord stops it, and holding the complete chord for 350 ms preserves hold-to-talk.
++
++- Local Light cleanup now validates exact wording before accepting model or cached output. Clear formatting cues, identifier underscores, and bounded weekday corrections are handled deterministically; unsupported edits preserve the transcript without retrying or escalating models. Windows model launches also suppress console creation without changing installed runtime binaries.
++
+ - Added desktop-only Paste in Chunks in Context Advanced settings. It inserts small pieces with pauses for CLI prompts, preserves the clipboard, and stops remaining chunks when focus or clipboard ownership changes.
+ 
+ - Fixed Linux shortcut capture rejecting Ctrl + Super when the WebView reports Super as an OS key.
+diff --git a/src-tauri/src/lib.rs b/src-tauri/src/lib.rs
+index 01b8311..f4db47c 100644
+--- a/src-tauri/src/lib.rs
++++ b/src-tauri/src/lib.rs
+@@ -549,8 +549,12 @@ pub fn run() {
+             let capture_state = shared.clone();
+             let app_handle = app.handle().clone();
+             tauri::async_runtime::spawn(async move {
++                let started = std::time::Instant::now();
++                let mut warmup = system::residency_policy::WarmupSchedule::default();
++                let mut first_tick = true;
+                 loop {
+-                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
++                    tokio::time::sleep(std::time::Duration::from_secs(if first_tick { 5 } else { 30 })).await;
++                    first_tick = false;
+                     pipeline::release_expired_capture_audio(&capture_state);
+                     // && (not ||): either manager signalling shutdown on its
+                     // own must not stop monitoring the other still-active one.
+@@ -582,17 +586,8 @@ pub fn run() {
+                     // (NVIDIA) VRAM right now — e.g. launching a demanding
+                     // game shouldn't have to wait 15 minutes for Verenu to
+                     // give back memory its local models are holding.
+-                    let stt_loaded = local_stt_manager
+-                        .current_model_id
+-                        .lock()
+-                        .map(|guard| guard.is_some())
+-                        .unwrap_or(false);
+-                    let llm_loaded = local_llm_manager
+-                        .current_model_id
+-                        .lock()
+-                        .map(|guard| guard.is_some())
+-                        .unwrap_or(false);
+-                    if stt_loaded || llm_loaded {
++                    let pressure_healthy;
++                    {
+                         // detect_resource_pressure() does blocking process
+                         // I/O (bounded by its own internal timeout) — run it
+                         // off the async worker thread so a slow/wedged
+@@ -603,20 +598,28 @@ pub fn run() {
+                         )
+                         .await
+                         .unwrap_or(None);
+-                        if let Some(reason) = pressure {
++                        pressure_healthy = pressure.is_none();
++                        if let Some(pressure) = pressure {
+                             log::warn!(
+-                                "local models: system resource pressure detected ({reason}), unloading proactively"
++                                "local models: system resource pressure detected ({}), critical={}; reclaiming eligible idle models",
++                                pressure.reason, pressure.critical
+                             );
+                             let pressure_stt = local_stt_manager.clone();
+                             let pressure_llm = local_llm_manager.clone();
+                             let pressure_app = app_handle.clone();
+                             let _ = tauri::async_runtime::spawn_blocking(move || {
+-                                pressure_stt.unload_for_resource_pressure(&pressure_app);
+-                                pressure_llm.unload_for_resource_pressure(&pressure_app);
++                                pressure_stt.unload_for_resource_pressure(&pressure_app, pressure.critical);
++                                pressure_llm.unload_for_resource_pressure(&pressure_app, pressure.critical);
+                             })
+                             .await;
+                         }
+                     }
++                    if let Err(error) = system::model_residency::maintain(
++                        &app_handle, &capture_state, &local_stt_manager, &local_llm_manager,
++                        &mut warmup, started.elapsed().as_millis() as u64, pressure_healthy,
++                    ).await {
++                        log::warn!("local models: background preload deferred: {error}");
++                    }
+                     crate::system::memory::reclaim_idle_memory(&capture_state).await;
+                 }
+             });
